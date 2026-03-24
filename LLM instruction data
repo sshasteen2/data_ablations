@@ -1,0 +1,156 @@
+# data_ablation_llm.py
+import json
+import logging
+import random
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, Dict, List, Optional
+
+import numpy as np
+import pandas as pd
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class AblationConfig:
+    name: str
+    fraction: float = 1.0                  # fraction of dataset to keep via random sampling
+    remove_func: Optional[Callable] = None  # optional filter: examples where this returns True are excluded
+
+
+def run_data_ablation(
+    dataset: List[Dict],
+    train_fn: Callable[[List[Dict]], float],
+    ablations: List[AblationConfig],
+    n_repeats: int = 2,
+    save_dir: str = "ablation_runs",
+    seed: int = 42,
+) -> List[Dict]:
+    """
+    Run data ablation experiments for LLM fine-tuning.
+
+    Args:
+        dataset:    List of instruction examples, e.g. [{"instruction": ..., "output": ...}, ...]
+        train_fn:   Callable that accepts a List[Dict] subset and returns a float score
+                    (e.g. fine-tune on subset → eval on held-out set → return F1/EM/reward).
+        ablations:  List of AblationConfig objects describing each experiment.
+        n_repeats:  Number of times to repeat each ablation for variance estimation.
+        save_dir:   Root directory for saving results.
+        seed:       Random seed for reproducibility.
+
+    Returns:
+        List of result dicts with keys: ablation, keep_frac, score_mean, score_std, n_repeats.
+    """
+    # Seed before anything random, including save_dir naming
+    random.seed(seed)
+    np.random.seed(seed)
+
+    run_id = random.randint(1000, 9999)
+    save_path = Path(save_dir) / f"seed_{seed}_{run_id}"
+    save_path.mkdir(parents=True, exist_ok=True)
+
+    results = []
+
+    def _run_ablation(name: str, sub_dataset: List[Dict], keep_frac: float) -> Dict:
+        scores = [train_fn(sub_dataset) for _ in range(n_repeats)]
+        return {
+            "ablation": name,
+            "keep_frac": keep_frac,
+            "n_examples": len(sub_dataset),
+            "score_mean": float(np.mean(scores)),
+            "score_std": float(np.std(scores)),
+            "n_repeats": n_repeats,
+        }
+
+    # --- Baseline (full dataset, no filtering) ---
+    logger.info("Running full dataset baseline...")
+    baseline_result = _run_ablation("baseline_full", dataset, keep_frac=1.0)
+    results.append(baseline_result)
+    logger.info(f"  Baseline score: {baseline_result['score_mean']:.4f} ± {baseline_result['score_std']:.4f}")
+
+    # --- Ablations ---
+    for abl in ablations:
+        logger.info(f"Running ablation: '{abl.name}' | fraction={abl.fraction:.2%} | filter={'yes' if abl.remove_func else 'no'}")
+
+        # Step 1: subsample if fraction < 1.0
+        if abl.fraction < 1.0:
+            k = max(1, int(len(dataset) * abl.fraction))
+            sub_dataset = random.sample(dataset, k=k)
+        else:
+            sub_dataset = list(dataset)  # copy to avoid mutating original
+
+        # Step 2: apply filter regardless of fraction
+        if abl.remove_func:
+            sub_dataset = [ex for ex in sub_dataset if not abl.remove_func(ex)]
+
+        if not sub_dataset:
+            logger.warning(f"  Ablation '{abl.name}' resulted in an empty dataset — skipping.")
+            continue
+
+        result = _run_ablation(abl.name, sub_dataset, keep_frac=abl.fraction)
+        results.append(result)
+        logger.info(f"  Score: {result['score_mean']:.4f} ± {result['score_std']:.4f} | n={result['n_examples']}")
+
+    # --- Save results ---
+    json_path = save_path / "ablation_results.json"
+    csv_path = save_path / "summary.csv"
+
+    with open(json_path, "w") as f:
+        json.dump(results, f, indent=2)
+
+    pd.DataFrame(results).to_csv(csv_path, index=False)
+    logger.info(f"Results saved to: {save_path}")
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Example usage
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+
+    def my_train_and_eval(examples: List[Dict]) -> float:
+        # Placeholder: fine-tune on `examples`, eval on held-out set, return score.
+        return random.uniform(0.68, 0.74)
+
+    # Simulate a dataset of 1000 instruction examples
+    dataset = [
+        {
+            "instruction": f"Example {i}",
+            "output": f"Response {i}",
+            "categories": ["reasoning"] if i % 5 == 0 else ["general"],
+            "conversations": list(range(i % 4 + 1)),  # variable turn counts
+        }
+        for i in range(1000)
+    ]
+
+    ablations = [
+        AblationConfig(name="subsample_50pct", fraction=0.5),
+        AblationConfig(name="subsample_20pct", fraction=0.2),
+        AblationConfig(
+            name="no_multi_turn",
+            fraction=1.0,
+            remove_func=lambda x: len(x.get("conversations", [])) > 2,
+        ),
+        AblationConfig(
+            name="only_simple_qa",
+            fraction=1.0,
+            remove_func=lambda x: "reasoning" in x.get("categories", []),
+        ),
+        AblationConfig(
+            name="subsample_50pct_no_multi_turn",
+            fraction=0.5,
+            remove_func=lambda x: len(x.get("conversations", [])) > 2,
+        ),
+    ]
+
+    results = run_data_ablation(
+        dataset=dataset,
+        train_fn=my_train_and_eval,
+        ablations=ablations,
+        n_repeats=3,
+        save_dir="llm_data_ablation",
+        seed=42,
+    )
