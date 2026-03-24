@@ -1,0 +1,106 @@
+import json
+import logging
+import random
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, Dict, List, Optional, Union, Any
+
+import numpy as np
+import pandas as pd
+from collections import defaultdict
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+@dataclass
+class AblationConfig:
+    name: str
+    fraction: float = 1.0
+    remove_func: Optional[Callable] = None
+    # New: if provided, we stratify by this key in the dictionary
+    stratify_by: Optional[str] = None 
+
+def run_data_ablation(
+    dataset: List[Dict],
+    train_fn: Callable[[List[Dict]], Dict[str, float]], # Now returns a Dict
+    ablations: List[AblationConfig],
+    n_repeats: int = 2,
+    save_dir: str = "ablation_runs",
+    seed: int = 42,
+) -> List[Dict]:
+    random.seed(seed)
+    np.random.seed(seed)
+
+    run_id = random.randint(1000, 9999)
+    save_path = Path(save_dir) / f"seed_{seed}_{run_id}"
+    save_path.mkdir(parents=True, exist_ok=True)
+
+    results = []
+
+    def _run_ablation(name: str, sub_dataset: List[Dict], keep_frac: float) -> Dict:
+        # Collect dicts of scores across repeats
+        all_repeats_metrics = [train_fn(sub_dataset) for _ in range(n_repeats)]
+        
+        # Aggregate metrics (mean/std for every key in the returned dict)
+        aggregated = {
+            "ablation": name,
+            "keep_frac": keep_frac,
+            "n_examples": len(sub_dataset),
+            "n_repeats": n_repeats,
+        }
+        
+        metric_keys = all_repeats_metrics[0].keys()
+        for key in metric_keys:
+            vals = [m[key] for m in all_repeats_metrics]
+            aggregated[f"{key}_mean"] = float(np.mean(vals))
+            aggregated[f"{key}_std"] = float(np.std(vals))
+            
+        return aggregated
+
+    def _get_stratified_sample(data: List[Dict], frac: float, stratify_key: str) -> List[Dict]:
+        groups = defaultdict(list)
+        for item in data:
+            # Handle list-type metadata (take the first category) or simple strings
+            val = item.get(stratify_key, "unknown")
+            group_key = val[0] if isinstance(val, list) and val else val
+            groups[group_key].append(item)
+            
+        sampled = []
+        for key, group in groups.items():
+            k = max(1, int(len(group) * frac))
+            sampled.extend(random.sample(group, k=k))
+        return sampled
+
+    # --- Baseline ---
+    logger.info("Running baseline...")
+    results.append(_run_ablation("baseline_full", dataset, 1.0))
+
+    # --- Ablations ---
+    for abl in ablations:
+        logger.info(f"Ablation: '{abl.name}' | Stratify: {abl.stratify_by}")
+
+        # Step 1: Subsample (Stratified vs Random)
+        if abl.fraction < 1.0:
+            if abl.stratify_by:
+                sub_dataset = _get_stratified_sample(dataset, abl.fraction, abl.stratify_by)
+            else:
+                k = max(1, int(len(dataset) * abl.fraction))
+                sub_dataset = random.sample(dataset, k=k)
+        else:
+            sub_dataset = list(dataset)
+
+        # Step 2: Filter
+        if abl.remove_func:
+            sub_dataset = [ex for ex in sub_dataset if not abl.remove_func(ex)]
+
+        if not sub_dataset:
+            continue
+
+        results.append(_run_ablation(abl.name, sub_dataset, abl.fraction))
+
+    # Save results
+    pd.DataFrame(results).to_csv(save_path / "summary.csv", index=False)
+    with open(save_path / "ablation_results.json", "w") as f:
+        json.dump(results, f, indent=2)
+
+    return results
